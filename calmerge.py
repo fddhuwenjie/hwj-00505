@@ -55,6 +55,9 @@ class VEvent:
     transp: str = "OPAQUE"
     all_day: bool = False
     _raw_rrule: str = ""
+    dtstart_tzid: str = ""
+    dtend_tzid: str = ""
+    dtstamp_tzid: str = ""
 
 
 @dataclass
@@ -66,6 +69,8 @@ class VTodo:
     dtstamp: Optional[datetime] = None
     status: str = "NEEDS-ACTION"
     percent_complete: int = 0
+    due_tzid: str = ""
+    dtstamp_tzid: str = ""
 
 
 @dataclass
@@ -77,9 +82,25 @@ class VAlarm:
 
 
 @dataclass
+class TZTransition:
+    dtstart: Optional[datetime] = None
+    tzoffsetfrom: str = ""
+    tzoffsetto: str = ""
+    tzname: str = ""
+
+
+@dataclass
+class VTimezone:
+    tzid: str = ""
+    standard: Optional[TZTransition] = None
+    daylight: Optional[TZTransition] = None
+
+
+@dataclass
 class VCalendar:
     events: list = field(default_factory=list)
     todos: list = field(default_factory=list)
+    timezones: dict = field(default_factory=dict)
     source: str = ""
 
 
@@ -124,8 +145,54 @@ def unfold_lines(lines: list) -> list:
     return unfolded
 
 
-def parse_datetime(value: str, params: dict = None) -> Optional[datetime]:
+def parse_tz_offset(offset_str: str) -> Optional[timedelta]:
+    m = re.match(r"^([+-])(\d{2})(\d{2})(\d{2})?$", offset_str)
+    if not m:
+        return None
+    sign = 1 if m.group(1) == "+" else -1
+    hours = int(m.group(2))
+    minutes = int(m.group(3))
+    seconds = int(m.group(4) or "00")
+    return sign * timedelta(hours=hours, minutes=minutes, seconds=seconds)
+
+
+def get_timezone_offset(tzid: str, dt: datetime, timezones: dict) -> Optional[timedelta]:
+    if not tzid or not timezones:
+        return None
+    tz = timezones.get(tzid)
+    if not tz:
+        return None
+    if not tz.daylight or not tz.standard:
+        if tz.standard and tz.standard.tzoffsetto:
+            return parse_tz_offset(tz.standard.tzoffsetto)
+        if tz.daylight and tz.daylight.tzoffsetto:
+            return parse_tz_offset(tz.daylight.tzoffsetto)
+        return None
+    dt_naive = dt.replace(tzinfo=None) if dt.tzinfo else dt
+    std_start = tz.standard.dtstart.replace(tzinfo=None) if tz.standard.dtstart else None
+    dst_start = tz.daylight.dtstart.replace(tzinfo=None) if tz.daylight.dtstart else None
+    if std_start and dst_start:
+        dt_year = dt_naive.year
+        std_month = std_start.month
+        dst_month = dst_start.month
+        if std_month < dst_month:
+            is_dst = (dt_naive.month, dt_naive.day) >= (dst_start.month, dst_start.day) and \
+                     (dt_naive.month, dt_naive.day) < (std_start.month, std_start.day)
+        else:
+            is_dst = not ((dt_naive.month, dt_naive.day) >= (std_start.month, std_start.day) and
+                          (dt_naive.month, dt_naive.day) < (dst_start.month, dst_start.day))
+    else:
+        is_dst = False
+    if is_dst:
+        offset_str = tz.daylight.tzoffsetto
+    else:
+        offset_str = tz.standard.tzoffsetto
+    return parse_tz_offset(offset_str)
+
+
+def parse_datetime(value: str, params: dict = None, timezones: dict = None) -> Optional[datetime]:
     params = params or {}
+    timezones = timezones or {}
     value = value.strip()
     if "VALUE" in params and params["VALUE"] == "DATE":
         try:
@@ -133,14 +200,26 @@ def parse_datetime(value: str, params: dict = None) -> Optional[datetime]:
             return d.replace(hour=0, minute=0, second=0)
         except ValueError:
             return None
-    for fmt in ("%Y%m%dT%H%M%SZ", "%Y%m%dT%H%M%S", "%Y%m%d"):
-        try:
-            dt = datetime.strptime(value, fmt)
-            if fmt == "%Y%m%dT%H%M%SZ":
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt
-        except ValueError:
-            continue
+    is_utc = value.endswith("Z")
+    fmt_without_z = "%Y%m%dT%H%M%S"
+    try:
+        dt = datetime.strptime(value.rstrip("Z"), fmt_without_z)
+        if is_utc:
+            dt = dt.replace(tzinfo=timezone.utc)
+        elif "TZID" in params:
+            tzid = params["TZID"]
+            offset = get_timezone_offset(tzid, dt, timezones)
+            if offset is not None:
+                tz = timezone(offset)
+                dt = dt.replace(tzinfo=tz)
+        return dt
+    except ValueError:
+        pass
+    try:
+        dt = datetime.strptime(value, "%Y%m%d")
+        return dt.replace(hour=0, minute=0, second=0)
+    except ValueError:
+        pass
     return None
 
 
@@ -160,7 +239,8 @@ def parse_content_line(line: str) -> tuple:
     return name, params, value
 
 
-def parse_rrule(value: str) -> dict:
+def parse_rrule(value: str, timezones: dict = None) -> dict:
+    timezones = timezones or {}
     result = {}
     for part in value.split(";"):
         if "=" in part:
@@ -174,7 +254,7 @@ def parse_rrule(value: str) -> dict:
                 except ValueError:
                     result[k] = v
             elif k == "UNTIL":
-                dt = parse_datetime(v)
+                dt = parse_datetime(v, timezones=timezones)
                 if dt:
                     result[k] = dt
                 else:
@@ -184,9 +264,71 @@ def parse_rrule(value: str) -> dict:
     return result
 
 
+def _parse_timezones(lines: list) -> dict:
+    timezones = {}
+    i = 0
+    current_tz = None
+    current_transition = None
+    in_standard = False
+    in_daylight = False
+
+    while i < len(lines):
+        line = lines[i]
+        name, params, value = parse_content_line(line)
+        if name is None:
+            i += 1
+            continue
+        if name == "BEGIN":
+            comp = value.upper()
+            if comp == "VTIMEZONE":
+                current_tz = VTimezone()
+            elif comp == "STANDARD" and current_tz is not None:
+                current_transition = TZTransition()
+                in_standard = True
+            elif comp == "DAYLIGHT" and current_tz is not None:
+                current_transition = TZTransition()
+                in_daylight = True
+        elif name == "END":
+            comp = value.upper()
+            if comp == "VTIMEZONE" and current_tz is not None:
+                if current_tz.tzid:
+                    timezones[current_tz.tzid] = current_tz
+                current_tz = None
+            elif comp == "STANDARD" and current_tz is not None:
+                if current_transition:
+                    current_tz.standard = current_transition
+                current_transition = None
+                in_standard = False
+            elif comp == "DAYLIGHT" and current_tz is not None:
+                if current_transition:
+                    current_tz.daylight = current_transition
+                current_transition = None
+                in_daylight = False
+        elif name == "TZID":
+            if current_tz is not None:
+                current_tz.tzid = value
+        elif name == "TZOFFSETFROM":
+            if current_transition is not None:
+                current_transition.tzoffsetfrom = value
+        elif name == "TZOFFSETTO":
+            if current_transition is not None:
+                current_transition.tzoffsetto = value
+        elif name == "TZNAME":
+            if current_transition is not None:
+                current_transition.tzname = value
+        elif name == "DTSTART":
+            if current_transition is not None:
+                current_transition.dtstart = parse_datetime(value, params, timezones)
+        i += 1
+    return timezones
+
+
 def parse_ics(text: str, source: str = "") -> VCalendar:
     cal = VCalendar(source=source)
     lines = unfold_lines(text.splitlines())
+
+    cal.timezones = _parse_timezones(lines)
+
     i = 0
     current_event = None
     current_todo = None
@@ -244,31 +386,41 @@ def parse_ics(text: str, source: str = "") -> VCalendar:
                 current_event.description = parse_ics_value(value)
         elif name == "DTSTART":
             if current_event is not None:
-                current_event.dtstart = parse_datetime(value, params)
+                current_event.dtstart = parse_datetime(value, params, cal.timezones)
+                if "TZID" in params:
+                    current_event.dtstart_tzid = params["TZID"]
                 if "VALUE" in params and params["VALUE"] == "DATE":
                     current_event.all_day = True
         elif name == "DTEND":
             if current_event is not None:
-                current_event.dtend = parse_datetime(value, params)
+                current_event.dtend = parse_datetime(value, params, cal.timezones)
+                if "TZID" in params:
+                    current_event.dtend_tzid = params["TZID"]
                 if "VALUE" in params and params["VALUE"] == "DATE":
                     current_event.all_day = True
         elif name == "DUE":
             if current_todo is not None:
-                current_todo.due = parse_datetime(value, params)
+                current_todo.due = parse_datetime(value, params, cal.timezones)
+                if "TZID" in params:
+                    current_todo.due_tzid = params["TZID"]
         elif name == "DTSTAMP":
-            dt = parse_datetime(value, params)
+            dt = parse_datetime(value, params, cal.timezones)
             if current_event is not None:
                 current_event.dtstamp = dt
+                if "TZID" in params:
+                    current_event.dtstamp_tzid = params["TZID"]
             elif current_todo is not None:
                 current_todo.dtstamp = dt
+                if "TZID" in params:
+                    current_todo.dtstamp_tzid = params["TZID"]
         elif name == "RRULE":
             if current_event is not None:
-                current_event.rrule = parse_rrule(value)
+                current_event.rrule = parse_rrule(value, cal.timezones)
                 current_event._raw_rrule = value
         elif name == "EXDATE":
             if current_event is not None:
                 for v in value.split(","):
-                    dt = parse_datetime(v.strip())
+                    dt = parse_datetime(v.strip(), params, cal.timezones)
                     if dt:
                         current_event.exdate.append(dt)
         elif name == "TRANSP":
@@ -302,6 +454,31 @@ def load_ics_file(path: str) -> VCalendar:
 WEEKDAY_MAP = {"MO": 0, "TU": 1, "WE": 2, "TH": 3, "FR": 4, "SA": 5, "SU": 6}
 
 
+def _parse_byday_parts(byday_list: list) -> list:
+    result = []
+    for item in byday_list:
+        match = re.match(r"^(-?\d+)?(MO|TU|WE|TH|FR|SA|SU)$", item.upper())
+        if match:
+            n = int(match.group(1)) if match.group(1) else None
+            wd = WEEKDAY_MAP[match.group(2)]
+            result.append((n, wd))
+    return result
+
+
+def _weekday_of_month(d: date) -> int:
+    return (d.day - 1) // 7 + 1
+
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    if month == 12:
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, month + 1, 1)
+    last_day = next_month - timedelta(days=1)
+    diff = (last_day.weekday() - weekday) % 7
+    return last_day - timedelta(days=diff)
+
+
 def expand_rrule(event: VEvent, range_start: date, range_end: date) -> list:
     occurrences = []
     if not event.dtstart:
@@ -318,110 +495,218 @@ def expand_rrule(event: VEvent, range_start: date, range_end: date) -> list:
     interval = rrule.get("INTERVAL", 1)
     count = rrule.get("COUNT")
     until = rrule.get("UNTIL")
-    byday = rrule.get("BYDAY", [])
+    byday_raw = rrule.get("BYDAY", [])
+    byday_parts = _parse_byday_parts(byday_raw)
 
     duration = timedelta(0)
     if event.dtend and event.dtstart:
         duration = event.dtend - event.dtstart
 
-    current = event.dtstart.replace(tzinfo=None) if event.dtstart.tzinfo else event.dtstart
+    start_tz = event.dtstart.tzinfo if event.dtstart and event.dtstart.tzinfo else None
+    start_dt = event.dtstart.replace(tzinfo=None) if event.dtstart.tzinfo else event.dtstart
+    start_time = start_dt.time()
+    start_date = start_dt.date()
+    start_weekday = start_date.weekday()
+
+    until_date = None
+    if until is not None:
+        until_naive = until.replace(tzinfo=None) if until.tzinfo else until
+        until_date = until_naive.date()
+
     generated = 0
-    max_iterations = 2000
+    max_occurrences = count if count else 2000
+    max_iterations = 10000
     iterations = 0
 
-    while iterations < max_iterations:
-        iterations += 1
+    def make_occurrence(d: date) -> Optional[VEvent]:
+        nonlocal generated
         if count is not None and generated >= count:
-            break
-        if until is not None:
-            until_naive = until.replace(tzinfo=None) if until.tzinfo else until
-            if current > until_naive:
+            return None
+        if until_date is not None and d > until_date:
+            return None
+        if d < range_start or d > range_end:
+            return None
+        dt = datetime.combine(d, start_time)
+        if start_tz is not None:
+            dt = dt.replace(tzinfo=start_tz)
+        exdate_match = False
+        for ex in event.exdate:
+            ex_naive = ex.replace(tzinfo=None) if ex.tzinfo else ex
+            if ex_naive.date() == d and ex_naive.time() == start_time:
+                exdate_match = True
+                break
+        if exdate_match:
+            return None
+        dt_end = dt + duration if event.dtend else None
+        new_ev = VEvent(
+            uid=event.uid,
+            summary=event.summary,
+            location=event.location,
+            description=event.description,
+            dtstart=dt,
+            dtend=dt_end,
+            dtstamp=event.dtstamp,
+            all_day=event.all_day,
+            transp=event.transp,
+            alarms=event.alarms,
+            rrule=event.rrule,
+            _raw_rrule=event._raw_rrule,
+            exdate=event.exdate,
+            dtstart_tzid=event.dtstart_tzid,
+            dtend_tzid=event.dtend_tzid,
+            dtstamp_tzid=event.dtstamp_tzid,
+        )
+        generated += 1
+        return new_ev
+
+    if freq == "DAILY":
+        current = start_date
+        while iterations < max_iterations and generated < max_occurrences:
+            iterations += 1
+            if current > range_end:
+                break
+            if until_date and current > until_date:
+                break
+            ev = make_occurrence(current)
+            if ev:
+                occurrences.append(ev)
+            current += timedelta(days=interval)
+
+    elif freq == "WEEKLY":
+        week_start = start_date - timedelta(days=start_weekday)
+        week_counter = 0
+
+        def get_week_dates(week_base: date) -> list:
+            dates = []
+            if byday_parts:
+                for _, wd in sorted(byday_parts, key=lambda x: x[1]):
+                    d = week_base + timedelta(days=wd)
+                    if d >= start_date:
+                        dates.append(d)
+            else:
+                if week_base + timedelta(days=start_weekday) >= start_date:
+                    dates.append(week_base + timedelta(days=start_weekday))
+            return sorted(dates)
+
+        while iterations < max_iterations and generated < max_occurrences:
+            iterations += 1
+            week_dates = get_week_dates(week_start)
+            if not week_dates and week_start < start_date:
+                week_start += timedelta(weeks=interval)
+                week_counter += interval
+                continue
+
+            has_after = False
+            for d in week_dates:
+                if d > range_end:
+                    has_after = True
+                    break
+                if until_date and d > until_date:
+                    has_after = True
+                    break
+                ev = make_occurrence(d)
+                if ev:
+                    occurrences.append(ev)
+            if has_after:
                 break
 
-        d = current.date()
-        if d > range_end:
-            break
+            week_start += timedelta(weeks=interval)
+            week_counter += interval
 
-        include = False
-        if freq == "DAILY":
-            include = True
-        elif freq == "WEEKLY":
-            if byday:
-                wd = current.weekday()
-                for day_code in byday:
-                    if WEEKDAY_MAP.get(day_code) == wd:
-                        include = True
-                        break
-            else:
-                include = True
-        elif freq == "MONTHLY":
-            if byday:
-                pass
-            else:
-                include = True
-        else:
-            include = True
+            if count and generated >= count:
+                break
 
-        if include and d >= range_start:
-            exdate_match = False
-            for ex in event.exdate:
-                ex_naive = ex.replace(tzinfo=None) if ex.tzinfo else ex
-                if ex_naive.date() == d and ex_naive.time() == current.time():
-                    exdate_match = True
+    elif freq == "MONTHLY":
+        current_year = start_date.year
+        current_month = start_date.month
+        month_counter = 0
+
+        def get_month_dates(year: int, month: int) -> list:
+            dates = []
+            if byday_parts:
+                for nth, wd in byday_parts:
+                    if nth is not None:
+                        if nth > 0:
+                            first_of_month = date(year, month, 1)
+                            first_wd = first_of_month.weekday()
+                            days_until = (wd - first_wd) % 7
+                            target = first_of_month + timedelta(days=days_until + (nth - 1) * 7)
+                            if target.month == month:
+                                dates.append(target)
+                        else:
+                            last_date = _last_weekday_of_month(year, month, wd)
+                            abs_nth = abs(nth)
+                            target = last_date - timedelta(days=(abs_nth - 1) * 7)
+                            if target.month == month and target >= date(year, month, 1):
+                                dates.append(target)
+                    else:
+                        first_of_month = date(year, month, 1)
+                        first_wd = first_of_month.weekday()
+                        days_until = (wd - first_wd) % 7
+                        d = first_of_month + timedelta(days=days_until)
+                        while d.month == month:
+                            dates.append(d)
+                            d += timedelta(days=7)
+            else:
+                try:
+                    d = date(year, month, start_date.day)
+                    dates.append(d)
+                except ValueError:
+                    pass
+            return sorted([d for d in dates if d >= start_date or (d.year, d.month) != (start_date.year, start_date.month)])
+
+        while iterations < max_iterations and generated < max_occurrences:
+            iterations += 1
+            month_dates = get_month_dates(current_year, current_month)
+
+            has_after = False
+            for d in sorted(month_dates):
+                if d > range_end:
+                    has_after = True
                     break
-            if not exdate_match:
-                new_ev = VEvent(
-                    uid=event.uid,
-                    summary=event.summary,
-                    location=event.location,
-                    description=event.description,
-                    dtstart=current,
-                    dtend=current + duration if event.dtend else None,
-                    dtstamp=event.dtstamp,
-                    all_day=event.all_day,
-                    transp=event.transp,
-                    alarms=event.alarms,
-                )
-                occurrences.append(new_ev)
-                generated += 1
+                if until_date and d > until_date:
+                    has_after = True
+                    break
+                if d >= start_date:
+                    ev = make_occurrence(d)
+                    if ev:
+                        occurrences.append(ev)
+            if has_after:
+                break
 
-        if freq == "DAILY":
-            current += timedelta(days=interval)
-        elif freq == "WEEKLY":
-            if byday:
-                found_next = False
-                for _ in range(14):
-                    current += timedelta(days=1)
-                    wd = current.weekday()
-                    for day_code in byday:
-                        if WEEKDAY_MAP.get(day_code) == wd:
-                            found_next = True
-                            break
-                    if found_next:
-                        break
-                if not found_next:
-                    current += timedelta(days=7 * interval)
-            else:
-                current += timedelta(weeks=interval)
-        elif freq == "MONTHLY":
-            year = current.year
-            month = current.month + interval
-            while month > 12:
-                month -= 12
-                year += 1
-            try:
-                current = current.replace(year=year, month=month)
-            except ValueError:
-                while True:
-                    try:
-                        current = current.replace(year=year, month=month, day=current.day - 1)
-                        break
-                    except ValueError:
-                        pass
-        else:
+            for _ in range(interval):
+                current_month += 1
+                if current_month > 12:
+                    current_month = 1
+                    current_year += 1
+            month_counter += interval
+
+            if count and generated >= count:
+                break
+
+            if current_year > range_end.year + 5:
+                break
+
+    else:
+        current = start_date
+        while iterations < max_iterations and generated < max_occurrences:
+            iterations += 1
+            if current > range_end:
+                break
+            ev = make_occurrence(current)
+            if ev:
+                occurrences.append(ev)
             current += timedelta(days=1)
 
     return occurrences
+
+
+def to_utc_naive(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 def detect_conflicts(calendars: list, ignore_all_day: bool = False, only_busy: bool = False) -> list:
@@ -435,19 +720,23 @@ def detect_conflicts(calendars: list, ignore_all_day: bool = False, only_busy: b
                     continue
                 all_events.append((ev, cal.source))
 
-    all_events.sort(key=lambda x: x[0].dtstart)
+    all_events.sort(key=lambda x: to_utc_naive(x[0].dtstart) or datetime.min)
     conflicts = []
 
     for i in range(len(all_events)):
         ev1, src1 = all_events[i]
+        ev1_start = to_utc_naive(ev1.dtstart)
+        ev1_end = to_utc_naive(ev1.dtend)
         for j in range(i + 1, len(all_events)):
             ev2, src2 = all_events[j]
-            if ev2.dtstart >= ev1.dtend:
+            ev2_start = to_utc_naive(ev2.dtstart)
+            ev2_end = to_utc_naive(ev2.dtend)
+            if ev2_start >= ev1_end:
                 break
             if src1 == src2 and ev1.uid == ev2.uid:
                 continue
-            overlap_start = max(ev1.dtstart, ev2.dtstart)
-            overlap_end = min(ev1.dtend, ev2.dtend)
+            overlap_start = max(ev1_start, ev2_start)
+            overlap_end = min(ev1_end, ev2_end)
             overlap_duration = overlap_end - overlap_start
             if overlap_duration.total_seconds() > 0:
                 conflicts.append({
@@ -465,6 +754,11 @@ def detect_conflicts(calendars: list, ignore_all_day: bool = False, only_busy: b
 def merge_calendars(calendars: list) -> tuple:
     merged = VCalendar(source="merged")
     conflicts_log = []
+
+    for cal in calendars:
+        for tzid, tz in cal.timezones.items():
+            if tzid not in merged.timezones:
+                merged.timezones[tzid] = tz
 
     event_map = {}
     for cal in calendars:
@@ -520,12 +814,68 @@ def merge_calendars(calendars: list) -> tuple:
     return merged, conflicts_log
 
 
-def to_ics_format(dt: datetime, all_day: bool = False) -> str:
+def to_ics_format(dt: datetime, all_day: bool = False, tzid: str = "") -> str:
     if all_day:
         return dt.strftime("%Y%m%d")
+    if tzid:
+        return dt.strftime("%Y%m%dT%H%M%S")
     if dt.tzinfo:
-        return dt.strftime("%Y%m%dT%H%M%SZ")
+        utc_dt = dt.astimezone(timezone.utc)
+        return utc_dt.strftime("%Y%m%dT%H%M%SZ")
     return dt.strftime("%Y%m%dT%H%M%S")
+
+
+def _datetime_to_local_str(dt: datetime, tzid: str, timezones: dict) -> str:
+    if tzid and tzid in timezones:
+        offset = get_timezone_offset(tzid, dt, timezones)
+        if offset is not None:
+            local_dt = dt.astimezone(timezone(offset))
+            return local_dt.strftime("%Y%m%dT%H%M%S")
+    if dt.tzinfo:
+        utc_dt = dt.astimezone(timezone.utc)
+        return utc_dt.strftime("%Y%m%dT%H%M%SZ")
+    return dt.strftime("%Y%m%dT%H%M%S")
+
+
+def _format_dt_field(field_name: str, dt: Optional[datetime], tzid: str = "",
+                     all_day: bool = False, timezones: dict = None) -> str:
+    if dt is None:
+        return ""
+    timezones = timezones or {}
+    if all_day:
+        return f"{field_name};VALUE=DATE:{to_ics_format(dt, True)}"
+    if tzid and tzid in timezones:
+        local_str = _datetime_to_local_str(dt, tzid, timezones)
+        return f"{field_name};TZID={tzid}:{local_str}"
+    return f"{field_name}:{to_ics_format(dt)}"
+
+
+def _export_timezone(tzid: str, tz: VTimezone) -> list:
+    lines = [f"BEGIN:VTIMEZONE", f"TZID:{tzid}"]
+    if tz.standard:
+        lines.append("BEGIN:STANDARD")
+        if tz.standard.dtstart:
+            lines.append(f"DTSTART:{to_ics_format(tz.standard.dtstart)}")
+        if tz.standard.tzoffsetfrom:
+            lines.append(f"TZOFFSETFROM:{tz.standard.tzoffsetfrom}")
+        if tz.standard.tzoffsetto:
+            lines.append(f"TZOFFSETTO:{tz.standard.tzoffsetto}")
+        if tz.standard.tzname:
+            lines.append(f"TZNAME:{tz.standard.tzname}")
+        lines.append("END:STANDARD")
+    if tz.daylight:
+        lines.append("BEGIN:DAYLIGHT")
+        if tz.daylight.dtstart:
+            lines.append(f"DTSTART:{to_ics_format(tz.daylight.dtstart)}")
+        if tz.daylight.tzoffsetfrom:
+            lines.append(f"TZOFFSETFROM:{tz.daylight.tzoffsetfrom}")
+        if tz.daylight.tzoffsetto:
+            lines.append(f"TZOFFSETTO:{tz.daylight.tzoffsetto}")
+        if tz.daylight.tzname:
+            lines.append(f"TZNAME:{tz.daylight.tzname}")
+        lines.append("END:DAYLIGHT")
+    lines.append("END:VTIMEZONE")
+    return lines
 
 
 def escape_ics_value(value: str) -> str:
@@ -534,22 +884,23 @@ def escape_ics_value(value: str) -> str:
 
 def export_to_ics(cal: VCalendar, output_path: str):
     lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//calmerge//CLI//EN"]
+
+    for tzid, tz in cal.timezones.items():
+        lines.extend(_export_timezone(tzid, tz))
+
     for ev in cal.events:
         lines.append("BEGIN:VEVENT")
         if ev.uid:
             lines.append(f"UID:{escape_ics_value(ev.uid)}")
         if ev.dtstart:
-            if ev.all_day:
-                lines.append(f"DTSTART;VALUE=DATE:{to_ics_format(ev.dtstart, True)}")
-            else:
-                lines.append(f"DTSTART:{to_ics_format(ev.dtstart)}")
+            lines.append(_format_dt_field("DTSTART", ev.dtstart, ev.dtstart_tzid,
+                                          ev.all_day, cal.timezones))
         if ev.dtend:
-            if ev.all_day:
-                lines.append(f"DTEND;VALUE=DATE:{to_ics_format(ev.dtend, True)}")
-            else:
-                lines.append(f"DTEND:{to_ics_format(ev.dtend)}")
+            lines.append(_format_dt_field("DTEND", ev.dtend, ev.dtend_tzid,
+                                          ev.all_day, cal.timezones))
         if ev.dtstamp:
-            lines.append(f"DTSTAMP:{to_ics_format(ev.dtstamp)}")
+            lines.append(_format_dt_field("DTSTAMP", ev.dtstamp, ev.dtstamp_tzid,
+                                          False, cal.timezones))
         if ev.summary:
             lines.append(f"SUMMARY:{escape_ics_value(ev.summary)}")
         if ev.location:
@@ -562,6 +913,17 @@ def export_to_ics(cal: VCalendar, output_path: str):
             lines.append(f"TRANSP:{ev.transp}")
         for ex in ev.exdate:
             lines.append(f"EXDATE:{to_ics_format(ex)}")
+        for alarm in ev.alarms:
+            lines.append("BEGIN:VALARM")
+            if alarm.action:
+                lines.append(f"ACTION:{alarm.action}")
+            if alarm.trigger:
+                lines.append(f"TRIGGER:{alarm.trigger}")
+            if alarm.description:
+                lines.append(f"DESCRIPTION:{escape_ics_value(alarm.description)}")
+            if alarm.summary:
+                lines.append(f"SUMMARY:{escape_ics_value(alarm.summary)}")
+            lines.append("END:VALARM")
         lines.append("END:VEVENT")
     for td in cal.todos:
         lines.append("BEGIN:VTODO")
@@ -572,9 +934,11 @@ def export_to_ics(cal: VCalendar, output_path: str):
         if td.description:
             lines.append(f"DESCRIPTION:{escape_ics_value(td.description)}")
         if td.due:
-            lines.append(f"DUE:{to_ics_format(td.due)}")
+            lines.append(_format_dt_field("DUE", td.due, td.due_tzid,
+                                          False, cal.timezones))
         if td.dtstamp:
-            lines.append(f"DTSTAMP:{to_ics_format(td.dtstamp)}")
+            lines.append(_format_dt_field("DTSTAMP", td.dtstamp, td.dtstamp_tzid,
+                                          False, cal.timezones))
         if td.status:
             lines.append(f"STATUS:{td.status}")
         lines.append(f"PERCENT-COMPLETE:{td.percent_complete}")
@@ -832,7 +1196,7 @@ def cmd_list(args):
         from_date=range_start if args.from_date else None,
         to_date=range_end if args.to_date else None,
     )
-    all_occurrences.sort(key=lambda x: x.dtstart or datetime.min)
+    all_occurrences.sort(key=lambda x: to_utc_naive(x.dtstart) or datetime.min)
     if not all_occurrences:
         print("未找到匹配的日程。")
         return
