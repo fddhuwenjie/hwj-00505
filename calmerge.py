@@ -1340,6 +1340,587 @@ def cmd_view(args):
         print(export_to_markdown(all_occurrences, title=args.title or "日程表"))
 
 
+@dataclass
+class Participant:
+    name: str
+    calendar: VCalendar
+    weight: float = 1.0
+
+
+@dataclass
+class BusyInterval:
+    start: datetime
+    end: datetime
+    summary: str
+    source: str
+    transp: str
+
+
+@dataclass
+class FreeSlot:
+    start: datetime
+    end: datetime
+
+
+@dataclass
+class Suggestion:
+    start: datetime
+    end: datetime
+    score: float
+    available_participants: list
+    busy_participants: list
+    conflicts: list
+    reasons: list
+
+
+def parse_time_str(s: str) -> tuple:
+    parts = s.split(":")
+    return int(parts[0]), int(parts[1])
+
+
+def get_target_timezone(timezone_name: str) -> Optional[timezone]:
+    try:
+        from datetime import timezone as dt_timezone
+        offset_map = {
+            "Asia/Shanghai": timedelta(hours=8),
+            "Asia/Tokyo": timedelta(hours=9),
+            "Asia/Hong_Kong": timedelta(hours=8),
+            "Asia/Singapore": timedelta(hours=8),
+            "Asia/Seoul": timedelta(hours=9),
+            "Asia/Bangkok": timedelta(hours=7),
+            "Asia/Kolkata": timedelta(hours=5, minutes=30),
+            "Asia/Dubai": timedelta(hours=4),
+            "Europe/London": timedelta(hours=0),
+            "Europe/Paris": timedelta(hours=1),
+            "Europe/Berlin": timedelta(hours=1),
+            "Europe/Moscow": timedelta(hours=3),
+            "America/New_York": timedelta(hours=-5),
+            "America/Chicago": timedelta(hours=-6),
+            "America/Denver": timedelta(hours=-7),
+            "America/Los_Angeles": timedelta(hours=-8),
+            "America/Toronto": timedelta(hours=-5),
+            "America/Sao_Paulo": timedelta(hours=-3),
+            "Australia/Sydney": timedelta(hours=10),
+            "Pacific/Auckland": timedelta(hours=12),
+            "UTC": timedelta(hours=0),
+        }
+        if timezone_name in offset_map:
+            return dt_timezone(offset_map[timezone_name])
+        return None
+    except Exception:
+        return None
+
+
+def convert_to_timezone(dt: datetime, target_tz: timezone) -> datetime:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(target_tz)
+
+
+def get_busy_intervals(cal: VCalendar, range_start: date, range_end: date,
+                       target_tz: timezone, ignore_all_day: bool = False) -> list:
+    busy = []
+    for ev in cal.events:
+        if ev.transp == "TRANSPARENT":
+            continue
+        if ignore_all_day and ev.all_day:
+            continue
+        occs = expand_rrule(ev, range_start, range_end)
+        for occ in occs:
+            if not occ.dtstart or not occ.dtend:
+                continue
+            start_utc = to_utc_naive(occ.dtstart)
+            end_utc = to_utc_naive(occ.dtend)
+            if start_utc is None or end_utc is None:
+                continue
+            start_dt = datetime.combine(start_utc.date(), start_utc.time(), tzinfo=timezone.utc)
+            end_dt = datetime.combine(end_utc.date(), end_utc.time(), tzinfo=timezone.utc)
+            start_local = convert_to_timezone(start_dt, target_tz)
+            end_local = convert_to_timezone(end_dt, target_tz)
+            if occ.all_day:
+                start_local = start_local.replace(hour=0, minute=0, second=0)
+                end_local = end_local.replace(hour=23, minute=59, second=59)
+            busy.append(BusyInterval(
+                start=start_local,
+                end=end_local,
+                summary=occ.summary or "(无标题)",
+                source=cal.source,
+                transp=occ.transp,
+            ))
+    busy.sort(key=lambda x: x.start)
+    return busy
+
+
+def merge_intervals(intervals: list) -> list:
+    if not intervals:
+        return []
+    sorted_intervals = sorted(intervals, key=lambda x: x.start)
+    merged = [sorted_intervals[0]]
+    for interval in sorted_intervals[1:]:
+        last = merged[-1]
+        if interval.start <= last.end:
+            new_end = max(last.end, interval.end)
+            merged[-1] = BusyInterval(
+                start=last.start,
+                end=new_end,
+                summary=last.summary + "; " + interval.summary,
+                source=last.source,
+                transp=last.transp,
+            )
+        else:
+            merged.append(interval)
+    return merged
+
+
+def get_free_slots(busy_intervals: list, day: date, work_start_hour: int,
+                   work_start_min: int, work_end_hour: int, work_end_min: int,
+                   lunch_start_hour: int = 0, lunch_start_min: int = 0,
+                   lunch_end_hour: int = 0, lunch_end_min: int = 0) -> list:
+    work_start = datetime.combine(day, datetime.min.time()).replace(
+        hour=work_start_hour, minute=work_start_min
+    )
+    work_end = datetime.combine(day, datetime.min.time()).replace(
+        hour=work_end_hour, minute=work_end_min
+    )
+
+    day_busy = []
+    for bi in busy_intervals:
+        bi_start = bi.start.replace(tzinfo=None)
+        bi_end = bi.end.replace(tzinfo=None)
+        if bi_end <= work_start or bi_start >= work_end:
+            continue
+        overlap_start = max(bi_start, work_start)
+        overlap_end = min(bi_end, work_end)
+        day_busy.append((overlap_start, overlap_end, bi.summary))
+
+    day_busy.sort(key=lambda x: x[0])
+
+    if lunch_start_hour > 0 or lunch_end_hour > 0:
+        lunch_start = datetime.combine(day, datetime.min.time()).replace(
+            hour=lunch_start_hour, minute=lunch_start_min
+        )
+        lunch_end = datetime.combine(day, datetime.min.time()).replace(
+            hour=lunch_end_hour, minute=lunch_end_min
+        )
+        if lunch_start < lunch_end:
+            day_busy.append((lunch_start, lunch_end, "午休时间"))
+            day_busy.sort(key=lambda x: x[0])
+
+    free_slots = []
+    current = work_start
+    for busy_start, busy_end, _ in day_busy:
+        if current < busy_start:
+            free_slots.append(FreeSlot(start=current, end=busy_start))
+        current = max(current, busy_end)
+    if current < work_end:
+        free_slots.append(FreeSlot(start=current, end=work_end))
+    return free_slots
+
+
+def intersect_free_slots(all_free: list, duration_minutes: int,
+                         earliest_hour: int = 0, earliest_min: int = 0,
+                         latest_hour: int = 23, latest_min: int = 59) -> list:
+    if not all_free:
+        return []
+    common = all_free[0][:]
+    for participant_free in all_free[1:]:
+        new_common = []
+        i = j = 0
+        while i < len(common) and j < len(participant_free):
+            s1, e1 = common[i].start, common[i].end
+            s2, e2 = participant_free[j].start, participant_free[j].end
+            overlap_start = max(s1, s2)
+            overlap_end = min(e1, e2)
+            if overlap_start < overlap_end:
+                new_common.append(FreeSlot(start=overlap_start, end=overlap_end))
+            if e1 < e2:
+                i += 1
+            else:
+                j += 1
+        common = new_common
+        if not common:
+            break
+
+    result = []
+    delta = timedelta(minutes=duration_minutes)
+    for slot in common:
+        slot_start = slot.start
+        slot_end = slot.end
+        earliest_dt = slot_start.replace(hour=earliest_hour, minute=earliest_min)
+        latest_dt = slot_start.replace(hour=latest_hour, minute=latest_min)
+        effective_start = max(slot_start, earliest_dt)
+        effective_end = min(slot_end, latest_dt)
+        if effective_end - effective_start >= delta:
+            result.append(FreeSlot(start=effective_start, end=effective_end))
+    return result
+
+
+def get_participant_availability(participant: Participant, slot_start: datetime,
+                                 slot_end: datetime, range_start: date,
+                                 range_end: date, target_tz: timezone,
+                                 ignore_all_day: bool = False) -> tuple:
+    busy = get_busy_intervals(participant.calendar, range_start, range_end,
+                              target_tz, ignore_all_day)
+    slot_start_naive = slot_start.replace(tzinfo=None)
+    slot_end_naive = slot_end.replace(tzinfo=None)
+
+    conflicts = []
+    for bi in busy:
+        bi_start = bi.start.replace(tzinfo=None)
+        bi_end = bi.end.replace(tzinfo=None)
+        if bi_start < slot_end_naive and bi_end > slot_start_naive:
+            conflicts.append({
+                "summary": bi.summary,
+                "start": bi.start,
+                "end": bi.end,
+                "source": bi.source,
+            })
+
+    is_available = len(conflicts) == 0
+    return is_available, conflicts
+
+
+def score_slot(slot_start: datetime, slot_end: datetime,
+               participants: list, range_start: date, range_end: date,
+               target_tz: timezone, ignore_all_day: bool = False) -> tuple:
+    available = []
+    busy = []
+    all_conflicts = []
+    total_weight = 0
+    available_weight = 0
+
+    for p in participants:
+        total_weight += p.weight
+        is_avail, conflicts = get_participant_availability(
+            p, slot_start, slot_end, range_start, range_end, target_tz, ignore_all_day
+        )
+        if is_avail:
+            available.append(p.name)
+            available_weight += p.weight
+        else:
+            busy.append(p.name)
+            all_conflicts.append({
+                "participant": p.name,
+                "conflicts": conflicts,
+            })
+
+    score = available_weight / total_weight if total_weight > 0 else 0
+
+    reasons = []
+    if score == 1.0:
+        reasons.append("所有参与者均可用")
+    else:
+        reasons.append(f"{len(available)}/{len(participants)} 位参与者可用")
+
+    hour = slot_start.hour
+    if 10 <= hour <= 11:
+        reasons.append("上午中段黄金时段")
+    elif 14 <= hour <= 16:
+        reasons.append("下午工作效率时段")
+    elif hour == 9:
+        reasons.append("早间时段，会议安排灵活")
+    elif hour >= 17:
+        reasons.append("临近下班时段")
+
+    return score, available, busy, all_conflicts, reasons
+
+
+def find_suggestions(participants: list, range_start: date, range_end: date,
+                     duration_minutes: int = 60,
+                     work_hours: str = "09:00-18:00",
+                     timezone_name: str = "Asia/Shanghai",
+                     lunch_break: str = "12:00-13:00",
+                     earliest_start: str = "09:00",
+                     latest_start: str = "17:00",
+                     top_n: int = 5,
+                     ignore_all_day: bool = False,
+                     include_all_day_free: bool = False) -> list:
+    target_tz = get_target_timezone(timezone_name)
+    if target_tz is None:
+        target_tz = timezone(timedelta(hours=8))
+
+    wh_start, wh_end = work_hours.split("-")
+    work_start_h, work_start_m = parse_time_str(wh_start)
+    work_end_h, work_end_m = parse_time_str(wh_end)
+
+    lunch_start_h, lunch_start_m = 0, 0
+    lunch_end_h, lunch_end_m = 0, 0
+    if lunch_break and lunch_break != "none":
+        ls, le = lunch_break.split("-")
+        lunch_start_h, lunch_start_m = parse_time_str(ls)
+        lunch_end_h, lunch_end_m = parse_time_str(le)
+
+    es_h, es_m = parse_time_str(earliest_start)
+    ls_h, ls_m = parse_time_str(latest_start)
+
+    all_participant_free = []
+    for p in participants:
+        busy = get_busy_intervals(p.calendar, range_start, range_end,
+                                  target_tz, ignore_all_day)
+        merged_busy = merge_intervals(busy)
+        p_free = []
+        current_date = range_start
+        while current_date <= range_end:
+            day_free = get_free_slots(
+                merged_busy, current_date,
+                work_start_h, work_start_m, work_end_h, work_end_m,
+                lunch_start_h, lunch_start_m, lunch_end_h, lunch_end_m
+            )
+            p_free.extend(day_free)
+            current_date += timedelta(days=1)
+        all_participant_free.append(p_free)
+
+    common_free = intersect_free_slots(
+        all_participant_free, duration_minutes,
+        es_h, es_m, ls_h, ls_m
+    )
+
+    suggestions = []
+    delta = timedelta(minutes=duration_minutes)
+
+    for slot in common_free:
+        slot_start = slot.start
+        slot_end = slot.end
+        step = timedelta(minutes=30)
+        current = slot_start
+        while current + delta <= slot_end + timedelta(seconds=1):
+            sugg_start = current
+            sugg_end = current + delta
+            score, available, busy_p, conflicts, reasons = score_slot(
+                sugg_start, sugg_end, participants,
+                range_start, range_end, target_tz, ignore_all_day
+            )
+            suggestions.append(Suggestion(
+                start=sugg_start,
+                end=sugg_end,
+                score=score,
+                available_participants=available,
+                busy_participants=busy_p,
+                conflicts=conflicts,
+                reasons=reasons,
+            ))
+            current += step
+
+    suggestions.sort(key=lambda s: (-s.score, s.start))
+
+    seen = set()
+    unique_suggestions = []
+    for s in suggestions:
+        key = (s.start, s.end)
+        if key not in seen:
+            seen.add(key)
+            unique_suggestions.append(s)
+            if len(unique_suggestions) >= top_n:
+                break
+
+    return unique_suggestions
+
+
+def export_suggestions_to_markdown(suggestions: list, participants: list,
+                                   params: dict) -> str:
+    lines = ["# 团队可用时间推荐报告", ""]
+    lines.append("## 参数信息")
+    lines.append(f"- **日期范围**: {params['range_start']} 至 {params['range_end']}")
+    lines.append(f"- **会议时长**: {params['duration']} 分钟")
+    lines.append(f"- **工作时间**: {params['work_hours']}")
+    lines.append(f"- **时区**: {params['timezone']}")
+    if params.get('lunch_break'):
+        lines.append(f"- **午休时间**: {params['lunch_break']}")
+    lines.append(f"- **最早开始**: {params['earliest_start']}")
+    lines.append(f"- **最晚开始**: {params['latest_start']}")
+    lines.append("")
+
+    lines.append("## 参与者")
+    for p in participants:
+        lines.append(f"- **{p.name}** (权重: {p.weight})")
+    lines.append("")
+
+    if not suggestions:
+        lines.append("## 推荐结果")
+        lines.append("")
+        lines.append("⚠️ **未找到符合条件的共同空闲时间**")
+        lines.append("")
+        lines.append("建议尝试以下方案：")
+        lines.append("1. 扩大日期范围")
+        lines.append("2. 缩短会议时长")
+        lines.append("3. 放宽工作时间限制")
+        lines.append("4. 考虑部分参与者可用的时段")
+        return "\n".join(lines)
+
+    lines.append(f"## 推荐 Top {len(suggestions)}")
+    lines.append("")
+
+    for idx, s in enumerate(suggestions, 1):
+        score_pct = int(s.score * 100)
+        lines.append(f"### 推荐 #{idx}: {score_pct}% 匹配度")
+        lines.append("")
+        lines.append(f"- **时间**: {s.start.strftime('%Y-%m-%d %H:%M')} - {s.end.strftime('%H:%M')}")
+        lines.append(f"- **可用参与者**: {', '.join(s.available_participants) if s.available_participants else '无'}")
+        if s.busy_participants:
+            lines.append(f"- **忙碌参与者**: {', '.join(s.busy_participants)}")
+        lines.append("")
+
+        if s.conflicts:
+            lines.append("#### 冲突详情")
+            lines.append("")
+            for cf in s.conflicts:
+                lines.append(f"**{cf['participant']}**:")
+                for c in cf['conflicts']:
+                    lines.append(f"- {c['start'].strftime('%H:%M')} - {c['end'].strftime('%H:%M')}: {c['summary']}")
+            lines.append("")
+
+        lines.append("#### 推荐理由")
+        lines.append("")
+        for reason in s.reasons:
+            lines.append(f"- {reason}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+def export_suggestions_to_json(suggestions: list, participants: list,
+                               params: dict) -> str:
+    sugg_list = []
+    for s in suggestions:
+        sugg_list.append({
+            "start": s.start.strftime("%Y-%m-%dT%H:%M:%S"),
+            "end": s.end.strftime("%Y-%m-%dT%H:%M:%S"),
+            "score": round(s.score, 4),
+            "available_participants": s.available_participants,
+            "busy_participants": s.busy_participants,
+            "conflicts": [
+                {
+                    "participant": c["participant"],
+                    "conflicts": [
+                        {
+                            "summary": cc["summary"],
+                            "start": cc["start"].strftime("%Y-%m-%dT%H:%M:%S"),
+                            "end": cc["end"].strftime("%Y-%m-%dT%H:%M:%S"),
+                            "source": cc["source"],
+                        }
+                        for cc in c["conflicts"]
+                    ]
+                }
+                for c in s.conflicts
+            ],
+            "reasons": s.reasons,
+        })
+
+    result = {
+        "params": {
+            "range_start": str(params["range_start"]),
+            "range_end": str(params["range_end"]),
+            "duration_minutes": params["duration"],
+            "work_hours": params["work_hours"],
+            "timezone": params["timezone"],
+            "lunch_break": params.get("lunch_break", ""),
+            "earliest_start": params["earliest_start"],
+            "latest_start": params["latest_start"],
+        },
+        "participants": [
+            {"name": p.name, "weight": p.weight, "source": p.calendar.source}
+            for p in participants
+        ],
+        "suggestions_count": len(suggestions),
+        "suggestions": sugg_list,
+    }
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def cmd_suggest(args):
+    calendars = [load_ics_file(p) for p in args.calendars]
+
+    participants = []
+    if args.names:
+        names = args.names.split(",")
+    else:
+        names = [Path(p).stem for p in args.calendars]
+
+    if args.weights:
+        weights = [float(w) for w in args.weights.split(",")]
+    else:
+        weights = [1.0] * len(calendars)
+
+    for i, cal in enumerate(calendars):
+        name = names[i] if i < len(names) else f"participant_{i+1}"
+        weight = weights[i] if i < len(weights) else 1.0
+        participants.append(Participant(name=name, calendar=cal, weight=weight))
+
+    range_start = parse_date_arg(args.from_date) if args.from_date else date.today()
+    range_end = parse_date_arg(args.to_date) if args.to_date else range_start + timedelta(days=7)
+
+    duration = args.duration if args.duration else 60
+    work_hours = args.work_hours if args.work_hours else "09:00-18:00"
+    tz_name = args.timezone if args.timezone else "Asia/Shanghai"
+    lunch = args.lunch if args.lunch else "12:00-13:00"
+    earliest = args.earliest if args.earliest else "09:00"
+    latest = args.latest if args.latest else "17:00"
+    top_n = args.top if args.top else 5
+    ignore_all_day = args.ignore_all_day
+
+    suggestions = find_suggestions(
+        participants, range_start, range_end,
+        duration_minutes=duration,
+        work_hours=work_hours,
+        timezone_name=tz_name,
+        lunch_break=lunch,
+        earliest_start=earliest,
+        latest_start=latest,
+        top_n=top_n,
+        ignore_all_day=ignore_all_day,
+    )
+
+    params = {
+        "range_start": range_start,
+        "range_end": range_end,
+        "duration": duration,
+        "work_hours": work_hours,
+        "timezone": tz_name,
+        "lunch_break": lunch if lunch != "none" else "",
+        "earliest_start": earliest,
+        "latest_start": latest,
+    }
+
+    if args.report:
+        report_path = args.report
+        if report_path.endswith(".json"):
+            content = export_suggestions_to_json(suggestions, participants, params)
+        else:
+            content = export_suggestions_to_markdown(suggestions, participants, params)
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(content)
+        print(green(f"✓ 推荐报告已导出到 {report_path}"))
+        print()
+
+    print(bold(f"团队可用时间推荐 (Top {top_n})"))
+    print(f"日期范围: {range_start} 至 {range_end}")
+    print(f"会议时长: {duration} 分钟")
+    print(f"时区: {tz_name}")
+    print(f"参与者: {', '.join([p.name for p in participants])}")
+    print()
+
+    if not suggestions:
+        print(yellow("⚠ 未找到所有参与者都可用的时间段。"))
+        print()
+        print("建议:")
+        print("  1. 扩大日期范围")
+        print("  2. 缩短会议时长")
+        print("  3. 放宽工作时间限制")
+        print("  4. 使用 --ignore-all-day 忽略全天事件")
+        return
+
+    for idx, s in enumerate(suggestions, 1):
+        score_pct = int(s.score * 100)
+        score_color = green if s.score == 1.0 else (yellow if s.score >= 0.6 else red)
+        print(f"  {bold(f'#{idx}')} {score_color(f'{score_pct}%')}  {blue(s.start.strftime('%Y-%m-%d %H:%M'))} - {s.end.strftime('%H:%M')}")
+        print(f"      可用: {', '.join(s.available_participants)}")
+        if s.busy_participants:
+            print(f"      忙碌: {red(', '.join(s.busy_participants))}")
+        if s.reasons:
+            print(f"      理由: {'; '.join(s.reasons[:2])}")
+        print()
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="calmerge",
@@ -1386,6 +1967,23 @@ def main():
     p_view.add_argument("--location", help="按地点过滤")
     p_view.add_argument("--title", help="Markdown标题")
     p_view.set_defaults(func=cmd_view)
+
+    p_suggest = subparsers.add_parser("suggest", help="团队可用时间智能推荐")
+    p_suggest.add_argument("calendars", nargs="+", help="多个ICS文件路径")
+    p_suggest.add_argument("--from", dest="from_date", help="起始日期 YYYY-MM-DD")
+    p_suggest.add_argument("--to", dest="to_date", help="结束日期 YYYY-MM-DD")
+    p_suggest.add_argument("--duration", type=int, help="会议时长(分钟)，默认60")
+    p_suggest.add_argument("--work-hours", help="工作时间窗口，如 09:00-18:00")
+    p_suggest.add_argument("--timezone", help="时区偏好，如 Asia/Shanghai")
+    p_suggest.add_argument("--lunch", help="午休时间，如 12:00-13:00，none表示无午休")
+    p_suggest.add_argument("--earliest", help="最早开始时间，如 09:00")
+    p_suggest.add_argument("--latest", help="最晚开始时间，如 17:00")
+    p_suggest.add_argument("--top", type=int, help="推荐Top N，默认5")
+    p_suggest.add_argument("--names", help="参与者名称，逗号分隔")
+    p_suggest.add_argument("--weights", help="参与者权重，逗号分隔")
+    p_suggest.add_argument("--ignore-all-day", action="store_true", help="忽略全天事件")
+    p_suggest.add_argument("--report", help="导出推荐报告路径 (.md 或 .json)")
+    p_suggest.set_defaults(func=cmd_suggest)
 
     args = parser.parse_args()
     if not args.command:
