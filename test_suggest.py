@@ -12,6 +12,7 @@ from calmerge import (
     get_busy_intervals, get_free_slots, intersect_free_slots,
     merge_intervals, get_target_timezone, convert_to_timezone,
     export_suggestions_to_markdown, export_suggestions_to_json,
+    get_timezone_offset_hours, score_slot,
 )
 
 passed = 0
@@ -413,6 +414,230 @@ END:VCALENDAR
         assert two_score > ten_score, "重要人物忙时的分数应该低于普通人物忙时"
 
     print("  ✓ 参与者权重正确影响评分")
+
+
+def test_weight_affects_ranking_order():
+    """测试权重真正影响推荐结果的排序（关键验证）"""
+    ics_boss = """BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VTIMEZONE
+TZID:Asia/Shanghai
+BEGIN:STANDARD
+DTSTART:20260101T000000
+TZOFFSETFROM:+0800
+TZOFFSETTO:+0800
+TZNAME:CST
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:boss-busy-morning
+DTSTAMP:20260615T090000Z
+DTSTART;TZID=Asia/Shanghai:20260622T100000
+DTEND;TZID=Asia/Shanghai:20260622T120000
+SUMMARY:老板上午有重要会议
+TRANSP:OPAQUE
+END:VEVENT
+END:VCALENDAR
+"""
+
+    ics_intern = """BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VTIMEZONE
+TZID:Asia/Shanghai
+BEGIN:STANDARD
+DTSTART:20260101T000000
+TZOFFSETFROM:+0800
+TZOFFSETTO:+0800
+TZNAME:CST
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:intern-busy-afternoon
+DTSTAMP:20260615T090000Z
+DTSTART;TZID=Asia/Shanghai:20260622T140000
+DTEND;TZID=Asia/Shanghai:20260622T160000
+SUMMARY:实习生下午培训
+TRANSP:OPAQUE
+END:VEVENT
+END:VCALENDAR
+"""
+
+    cal_boss = parse_ics(ics_boss, source="boss")
+    cal_intern = parse_ics(ics_intern, source="intern")
+
+    participants_equal = [
+        Participant(name="boss", calendar=cal_boss, weight=1.0),
+        Participant(name="intern", calendar=cal_intern, weight=1.0),
+    ]
+
+    sug_equal = find_suggestions(
+        participants_equal, date(2026, 6, 22), date(2026, 6, 22),
+        duration_minutes=60, work_hours="09:00-18:00",
+        timezone_name="Asia/Shanghai", lunch_break="none",
+        earliest_start="09:00", latest_start="17:00", top_n=20,
+    )
+
+    morning_scores_equal = {}
+    afternoon_scores_equal = {}
+    for s in sug_equal:
+        h = s.start.hour
+        if 9 <= h < 12:
+            morning_scores_equal[h] = s.score
+        elif 14 <= h < 17:
+            afternoon_scores_equal[h] = s.score
+
+    participants_unequal = [
+        Participant(name="boss", calendar=cal_boss, weight=10.0),
+        Participant(name="intern", calendar=cal_intern, weight=1.0),
+    ]
+
+    sug_unequal = find_suggestions(
+        participants_unequal, date(2026, 6, 22), date(2026, 6, 22),
+        duration_minutes=60, work_hours="09:00-18:00",
+        timezone_name="Asia/Shanghai", lunch_break="none",
+        earliest_start="09:00", latest_start="17:00", top_n=20,
+    )
+
+    morning_scores_unequal = {}
+    afternoon_scores_unequal = {}
+    for s in sug_unequal:
+        h = s.start.hour
+        if 9 <= h < 12:
+            morning_scores_unequal[h] = s.score
+        elif 14 <= h < 17:
+            afternoon_scores_unequal[h] = s.score
+
+    print("  ✓ 等权重情况:")
+    print(f"    上午(老板忙)分数: {morning_scores_equal}")
+    print(f"    下午(实习生忙)分数: {afternoon_scores_equal}")
+
+    print("  ✓ 老板权重10, 实习生权重1:")
+    print(f"    上午(老板忙)分数: {morning_scores_unequal}")
+    print(f"    下午(实习生忙)分数: {afternoon_scores_unequal}")
+
+    top_unequal = sug_unequal[0] if sug_unequal else None
+    top_equal = sug_equal[0] if sug_equal else None
+
+    if top_unequal and top_equal:
+        print(f"  ✓ 等权重Top1: {top_equal.start.strftime('%H:%M')} (分数 {int(top_equal.score*100)}%)")
+        print(f"  ✓ 不等权重Top1: {top_unequal.start.strftime('%H:%M')} (分数 {int(top_unequal.score*100)}%)")
+
+    nine_am_equal = morning_scores_equal.get(9, -1)
+    two_pm_equal = afternoon_scores_equal.get(14, -1)
+
+    nine_am_unequal = morning_scores_unequal.get(9, -1)
+    two_pm_unequal = afternoon_scores_unequal.get(14, -1)
+
+    if nine_am_unequal >= 0 and two_pm_unequal >= 0:
+        assert two_pm_unequal > nine_am_unequal, \
+            f"老板权重高时，下午(实习生忙 {two_pm_unequal}) 分数应高于上午(老板忙 {nine_am_unequal})"
+
+    if nine_am_equal >= 0 and two_pm_equal >= 0:
+        assert abs(nine_am_equal - two_pm_equal) < 0.01, \
+            f"等权重时上午({nine_am_equal})和下午({two_pm_equal})分数应基本相同"
+
+    if top_unequal:
+        assert top_unequal.start.hour >= 14 or top_unequal.start.hour < 10, \
+            f"老板权重高时Top1应避开老板忙碌时段，实际是 {top_unequal.start.strftime('%H:%M')}"
+
+    print("  ✓ 权重差异导致推荐排序变化：验证通过")
+
+
+def test_daylight_saving_time_aware():
+    """测试夏令时时区正确计算（纽约夏季EDT=-4，冬季EST=-5）"""
+    tz_ny = get_target_timezone("America/New_York")
+    assert tz_ny is not None, "应该能获取纽约时区"
+
+    summer_dt = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+    winter_dt = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+
+    summer_local = summer_dt.astimezone(tz_ny)
+    winter_local = winter_dt.astimezone(tz_ny)
+
+    summer_offset_hours = summer_local.utcoffset().total_seconds() / 3600
+    winter_offset_hours = winter_local.utcoffset().total_seconds() / 3600
+
+    print(f"  ✓ 纽约夏季(7月)偏移: {summer_offset_hours}小时")
+    print(f"  ✓ 纽约冬季(1月)偏移: {winter_offset_hours}小时")
+    print(f"  ✓ 夏季本地时间: {summer_local.strftime('%Y-%m-%d %H:%M')}")
+    print(f"  ✓ 冬季本地时间: {winter_local.strftime('%Y-%m-%d %H:%M')}")
+
+    assert abs(summer_offset_hours - (-4.0)) < 0.1, \
+        f"纽约夏季(EDT)偏移应为-4小时，实际{summer_offset_hours}"
+    assert abs(winter_offset_hours - (-5.0)) < 0.1, \
+        f"纽约冬季(EST)偏移应为-5小时，实际{winter_offset_hours}"
+
+    ics_ny_summer = """BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VTIMEZONE
+TZID:America/New_York
+BEGIN:STANDARD
+DTSTART:20261101T020000
+TZOFFSETFROM:-0400
+TZOFFSETTO:-0500
+TZNAME:EST
+END:STANDARD
+BEGIN:DAYLIGHT
+DTSTART:20260308T020000
+TZOFFSETFROM:-0500
+TZOFFSETTO:-0400
+TZNAME:EDT
+END:DAYLIGHT
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:ny-summer-meeting
+DTSTAMP:20260615T090000Z
+DTSTART;TZID=America/New_York:20260715T090000
+DTEND;TZID=America/New_York:20260715T100000
+SUMMARY:纽约夏季会议
+TRANSP:OPAQUE
+END:VEVENT
+END:VCALENDAR
+"""
+
+    cal_ny = parse_ics(ics_ny_summer, source="ny")
+    target_tz_shanghai = get_target_timezone("Asia/Shanghai")
+
+    busy = get_busy_intervals(
+        cal_ny, date(2026, 7, 15), date(2026, 7, 15), target_tz_shanghai
+    )
+
+    assert len(busy) == 1, f"应该有1个忙碌时段，实际{len(busy)}"
+    ny_meeting = busy[0]
+
+    shanghai_hour = ny_meeting.start.hour
+    expected_shanghai_hour = 21
+
+    print(f"  ✓ 纽约9点(EDT)会议在上海时区: {shanghai_hour}点")
+    print(f"  ✓ 预期上海时间: {expected_shanghai_hour}点 (9+12时差)")
+
+    assert shanghai_hour == expected_shanghai_hour, \
+        f"夏令时换算错误：纽约9:00 EDT 应等于上海 21:00，实际 {shanghai_hour}:00"
+
+    print("  ✓ 夏令时时区换算正确：验证通过")
+
+
+def test_daylight_saving_with_london():
+    """测试伦敦夏令时（BST=+1 vs GMT=+0）"""
+    tz_london = get_target_timezone("Europe/London")
+    assert tz_london is not None, "应该能获取伦敦时区"
+
+    summer_dt = datetime(2026, 7, 15, 12, 0, tzinfo=timezone.utc)
+    winter_dt = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
+
+    summer_local = summer_dt.astimezone(tz_london)
+    winter_local = winter_dt.astimezone(tz_london)
+
+    summer_offset = summer_local.utcoffset().total_seconds() / 3600
+    winter_offset = winter_local.utcoffset().total_seconds() / 3600
+
+    print(f"  ✓ 伦敦夏季偏移: {summer_offset}小时 (BST)")
+    print(f"  ✓ 伦敦冬季偏移: {winter_offset}小时 (GMT)")
+
+    assert abs(summer_offset - 1.0) < 0.1, f"伦敦夏季偏移应为+1，实际{summer_offset}"
+    assert abs(winter_offset - 0.0) < 0.1, f"伦敦冬季偏移应为0，实际{winter_offset}"
+
+    print("  ✓ 伦敦夏令时测试通过")
 
 
 def test_all_day_event_handling():
@@ -885,7 +1110,10 @@ def main():
         ("TRANSP透明状态处理", test_transparent_free_status),
         ("跨时区推荐", test_cross_timezone_suggestions),
         ("无共同空闲时间", test_no_common_free_time),
-        ("参与者权重", test_participant_weights),
+        ("参与者权重基础", test_participant_weights),
+        ("权重影响排序", test_weight_affects_ranking_order),
+        ("纽约夏令时计算", test_daylight_saving_time_aware),
+        ("伦敦夏令时计算", test_daylight_saving_with_london),
         ("全天事件处理", test_all_day_event_handling),
         ("工作时间窗口", test_work_hours_window),
         ("最早最晚开始时间", test_earliest_latest_start),

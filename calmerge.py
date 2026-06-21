@@ -1378,7 +1378,17 @@ def parse_time_str(s: str) -> tuple:
     return int(parts[0]), int(parts[1])
 
 
-def get_target_timezone(timezone_name: str) -> Optional[timezone]:
+def get_target_timezone(timezone_name: str):
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(timezone_name)
+    except Exception:
+        pass
+    try:
+        from backports.zoneinfo import ZoneInfo
+        return ZoneInfo(timezone_name)
+    except Exception:
+        pass
     try:
         from datetime import timezone as dt_timezone
         offset_map = {
@@ -1411,14 +1421,28 @@ def get_target_timezone(timezone_name: str) -> Optional[timezone]:
         return None
 
 
-def convert_to_timezone(dt: datetime, target_tz: timezone) -> datetime:
+def convert_to_timezone(dt: datetime, target_tz) -> datetime:
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(target_tz)
 
 
+def get_timezone_offset_hours(tz_name: str, dt: datetime) -> Optional[float]:
+    tz = get_target_timezone(tz_name)
+    if tz is None:
+        return None
+    try:
+        aware_dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
+        offset = aware_dt.astimezone(tz).utcoffset()
+        if offset is not None:
+            return offset.total_seconds() / 3600.0
+    except Exception:
+        pass
+    return None
+
+
 def get_busy_intervals(cal: VCalendar, range_start: date, range_end: date,
-                       target_tz: timezone, ignore_all_day: bool = False) -> list:
+                       target_tz, ignore_all_day: bool = False) -> list:
     busy = []
     for ev in cal.events:
         if ev.transp == "TRANSPARENT":
@@ -1557,7 +1581,7 @@ def intersect_free_slots(all_free: list, duration_minutes: int,
 
 def get_participant_availability(participant: Participant, slot_start: datetime,
                                  slot_end: datetime, range_start: date,
-                                 range_end: date, target_tz: timezone,
+                                 range_end: date, target_tz,
                                  ignore_all_day: bool = False) -> tuple:
     busy = get_busy_intervals(participant.calendar, range_start, range_end,
                               target_tz, ignore_all_day)
@@ -1582,19 +1606,41 @@ def get_participant_availability(participant: Participant, slot_start: datetime,
 
 def score_slot(slot_start: datetime, slot_end: datetime,
                participants: list, range_start: date, range_end: date,
-               target_tz: timezone, ignore_all_day: bool = False) -> tuple:
+               target_tz, ignore_all_day: bool = False,
+               participant_busy_cache: dict = None) -> tuple:
     available = []
     busy = []
     all_conflicts = []
     total_weight = 0
     available_weight = 0
 
+    slot_start_naive = slot_start.replace(tzinfo=None)
+    slot_end_naive = slot_end.replace(tzinfo=None)
+
     for p in participants:
         total_weight += p.weight
-        is_avail, conflicts = get_participant_availability(
-            p, slot_start, slot_end, range_start, range_end, target_tz, ignore_all_day
-        )
-        if is_avail:
+
+        if participant_busy_cache is not None and p.name in participant_busy_cache:
+            busy_intervals = participant_busy_cache[p.name]
+        else:
+            busy_intervals = get_busy_intervals(
+                p.calendar, range_start, range_end, target_tz, ignore_all_day
+            )
+
+        conflicts = []
+        for bi in busy_intervals:
+            bi_start = bi.start.replace(tzinfo=None)
+            bi_end = bi.end.replace(tzinfo=None)
+            if bi_start < slot_end_naive and bi_end > slot_start_naive:
+                conflicts.append({
+                    "summary": bi.summary,
+                    "start": bi.start,
+                    "end": bi.end,
+                    "source": bi.source,
+                })
+
+        is_available = len(conflicts) == 0
+        if is_available:
             available.append(p.name)
             available_weight += p.weight
         else:
@@ -1610,7 +1656,7 @@ def score_slot(slot_start: datetime, slot_end: datetime,
     if score == 1.0:
         reasons.append("所有参与者均可用")
     else:
-        reasons.append(f"{len(available)}/{len(participants)} 位参与者可用")
+        reasons.append(f"{len(available)}/{len(participants)} 位参与者可用 (加权 {int(score*100)}%)")
 
     hour = slot_start.hour
     if 10 <= hour <= 11:
@@ -1653,59 +1699,85 @@ def find_suggestions(participants: list, range_start: date, range_end: date,
     es_h, es_m = parse_time_str(earliest_start)
     ls_h, ls_m = parse_time_str(latest_start)
 
-    all_participant_free = []
+    participant_busy = {}
     for p in participants:
         busy = get_busy_intervals(p.calendar, range_start, range_end,
                                   target_tz, ignore_all_day)
-        merged_busy = merge_intervals(busy)
-        p_free = []
-        current_date = range_start
-        while current_date <= range_end:
-            day_free = get_free_slots(
-                merged_busy, current_date,
-                work_start_h, work_start_m, work_end_h, work_end_m,
-                lunch_start_h, lunch_start_m, lunch_end_h, lunch_end_m
-            )
-            p_free.extend(day_free)
-            current_date += timedelta(days=1)
-        all_participant_free.append(p_free)
+        participant_busy[p.name] = merge_intervals(busy)
 
-    common_free = intersect_free_slots(
-        all_participant_free, duration_minutes,
-        es_h, es_m, ls_h, ls_m
+    earliest_dt = datetime.combine(range_start, datetime.min.time()).replace(
+        hour=es_h, minute=es_m
+    )
+    latest_dt = datetime.combine(range_end, datetime.min.time()).replace(
+        hour=ls_h, minute=ls_m
     )
 
-    suggestions = []
-    delta = timedelta(minutes=duration_minutes)
+    lunch_start_min = lunch_start_h * 60 + lunch_start_m if (lunch_start_h or lunch_start_m) else None
+    lunch_end_min = lunch_end_h * 60 + lunch_end_m if (lunch_end_h or lunch_end_m) else None
+    work_start_min = work_start_h * 60 + work_start_m
+    work_end_min = work_end_h * 60 + work_end_m
+    earliest_min = es_h * 60 + es_m
+    latest_min = ls_h * 60 + ls_m
 
-    for slot in common_free:
-        slot_start = slot.start
-        slot_end = slot.end
-        step = timedelta(minutes=30)
-        current = slot_start
-        while current + delta <= slot_end + timedelta(seconds=1):
-            sugg_start = current
-            sugg_end = current + delta
+    all_suggestions = []
+    delta = timedelta(minutes=duration_minutes)
+    step = timedelta(minutes=30)
+
+    current_day = range_start
+    while current_day <= range_end:
+        day_start = datetime.combine(current_day, datetime.min.time())
+
+        candidate_start = day_start.replace(hour=work_start_h, minute=work_start_m)
+        candidate_end_limit = day_start.replace(hour=work_end_h, minute=work_end_m) - delta
+
+        earliest_today = day_start.replace(hour=es_h, minute=es_m)
+        latest_today = day_start.replace(hour=ls_h, minute=ls_m)
+
+        effective_start = max(candidate_start, earliest_today)
+        effective_end_limit = min(candidate_end_limit, latest_today)
+
+        if effective_end_limit <= effective_start:
+            current_day += timedelta(days=1)
+            continue
+
+        current_time = effective_start
+        while current_time <= effective_end_limit + timedelta(seconds=1):
+            slot_start = current_time
+            slot_end = current_time + delta
+
+            slot_start_min = slot_start.hour * 60 + slot_start.minute
+            slot_end_min = slot_end.hour * 60 + slot_end.minute
+
+            if lunch_start_min is not None and lunch_end_min is not None:
+                if not (slot_end_min <= lunch_start_min or slot_start_min >= lunch_end_min):
+                    current_time += step
+                    continue
+
             score, available, busy_p, conflicts, reasons = score_slot(
-                sugg_start, sugg_end, participants,
-                range_start, range_end, target_tz, ignore_all_day
+                slot_start, slot_end, participants,
+                range_start, range_end, target_tz, ignore_all_day,
+                participant_busy_cache=participant_busy
             )
-            suggestions.append(Suggestion(
-                start=sugg_start,
-                end=sugg_end,
+
+            all_suggestions.append(Suggestion(
+                start=slot_start,
+                end=slot_end,
                 score=score,
                 available_participants=available,
                 busy_participants=busy_p,
                 conflicts=conflicts,
                 reasons=reasons,
             ))
-            current += step
+            current_time += step
 
-    suggestions.sort(key=lambda s: (-s.score, s.start))
+        current_day += timedelta(days=1)
+
+    meaningful_suggestions = [s for s in all_suggestions if s.score > 0]
+    meaningful_suggestions.sort(key=lambda s: (-s.score, s.start))
 
     seen = set()
     unique_suggestions = []
-    for s in suggestions:
+    for s in meaningful_suggestions:
         key = (s.start, s.end)
         if key not in seen:
             seen.add(key)
